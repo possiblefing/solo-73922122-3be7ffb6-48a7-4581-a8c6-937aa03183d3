@@ -25,14 +25,31 @@ class Settings:
     staging_dir: str        # 半封附件的临时落盘区（对外不可见）
     lock_path: str          # 单采集进程文件锁
 
+    # ---- 原件加密 / 存量迁移 ----
+    key_file: str           # AES-256 密钥文件；必须位于 data_dir 之外，只读加载
+    migration_lock_path: str  # 单迁移进程文件锁
+    migration_auto_resume: bool  # 重启后自动续办未完成迁移
+    migration_allow_demo_fault: bool  # 是否允许 /docs 触发"切换前/后退出"演示故障
+
 
 def _env(key: str, default: str) -> str:
     value = os.environ.get(key)
     return value if value not in (None, "") else default
 
 
+def _env_bool(key: str, default: bool) -> bool:
+    value = os.environ.get(key)
+    if value in (None, ""):
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
 def load_settings() -> Settings:
     data_dir = _env("DATA_DIR", "/data")
+    # 密钥文件默认放在 data_dir 的兄弟目录：数据目录打包/备份时不会带上密钥
+    default_key = os.path.join(
+        os.path.dirname(os.path.abspath(data_dir)), "secrets", "blob.key"
+    )
     return Settings(
         imap_host=_env("IMAP_HOST", "imap"),
         imap_port=int(_env("IMAP_PORT", "143")),
@@ -46,4 +63,8 @@ def load_settings() -> Settings:
         blob_root=os.path.join(data_dir, "blobs"),
         staging_dir=os.path.join(data_dir, "staging"),
         lock_path=os.path.join(data_dir, "collect.lock"),
+        key_file=_env("BLOB_KEY_FILE", default_key),
+        migration_lock_path=os.path.join(data_dir, "migrate.lock"),
+        migration_auto_resume=_env_bool("MIGRATION_AUTO_RESUME", True),
+        migration_allow_demo_fault=_env_bool("MIGRATION_ALLOW_DEMO_FAULT", True),
     )

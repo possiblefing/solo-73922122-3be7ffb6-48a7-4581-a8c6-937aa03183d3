@@ -1,4 +1,4 @@
-"""采集流水线：逐封 UID 拉取、附件原子落盘、索引与进度同事务提交。
+"""采集流水线：逐封 UID 拉取、附件加密后原子落盘、索引与进度同事务提交。
 
 故障语义（对应需求）：
 - 断流 / 落盘失败 / 进程退出：该封不推进进度、staging 临时件被丢弃（或重启清理），
@@ -6,7 +6,9 @@
 - 重启续采：已落库邮件（done/oversize/failed）按 (UIDVALIDITY, UID) 跳过，
   断流/落盘失败等未落库的邮件重新拉取；正式路径由 UIDVALIDITY/UID/部分序号确定，重试幂等、不重复；
 - 邮箱重建（UIDVALIDITY 变化）：建立新的邮箱代际记录，在新 UID 空间重新采集，
-  旧代际的原件与来源记录原样保留、仍可查询下载。
+  旧代际的原件与来源记录原样保留、仍可查询下载；
+- 加密：PDF 在内存中即用 AES-256-GCM 加密，staging 与正式目录都只有密文；
+  加密与文件读写全部在 SQLite 事务之外进行，不持有写锁。
 """
 from __future__ import annotations
 
@@ -132,13 +134,18 @@ class Collector:
                 counters["failed"] += 1
                 return None
 
-            # 5) 全部附件先落 staging（任一失败即整封放弃）
+            # 5) 全部附件先加密并落 staging（任一失败即整封放弃）
+            encrypted_blobs: list = []
             for part in parts:
-                storage.write_staged(staging, part)
+                encrypted_blobs.append(
+                    storage.write_staged(staging, part, uidvalidity, uid)
+                )
 
-            # 6) 整封原子发布到正式目录
+            # 6) 整封原子发布到正式目录（发布后只有密文）
             try:
-                published = storage.publish_all(staging, parts, uidvalidity, uid)
+                published = storage.publish_all(
+                    staging, parts, encrypted_blobs, uidvalidity, uid
+                )
             except OSError as exc:
                 return f"UID {uid} 附件发布失败（磁盘错误）: {exc}"
 
@@ -150,11 +157,15 @@ class Collector:
                     headers.get("subject"), headers.get("from_header"),
                     headers.get("message_id_hdr"),
                 )
-                for part, (rel_path, size_bytes) in zip(parts, published):
+                for part, blob in zip(parts, published):
                     db.insert_attachment(
                         db._conn, message_pk, part.part_number,
                         stored_filename(part), part.content_type,
-                        size_bytes, rel_path,
+                        blob.plain_size, blob.storage_path,
+                        storage_state="cipher",
+                        plain_sha256=blob.plain_sha256,
+                        cipher_sha256=blob.cipher_sha256,
+                        key_id=self._storage.key_id,
                     )
                 db.commit()
             except Exception:
